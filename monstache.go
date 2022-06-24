@@ -203,10 +203,21 @@ type relation struct {
 	col            string
 }
 
+type indexTimeRollover struct {
+	// 类型 绝对值 absolute 相对值 relative
+	Type string
+	// 滚动时间 1s 1h 1d 7d 15d
+	Time     string
+	Duration time.Duration
+	Format   string
+	Field    string
+}
+
 type indexMapping struct {
 	Namespace string
 	Index     string
 	Pipeline  string
+	Rollover  *indexTimeRollover
 }
 
 type findConf struct {
@@ -729,11 +740,219 @@ func (ic *indexClient) defaultIndexMapping(op *gtm.Op) *indexMapping {
 	}
 }
 
+var unitMap = map[string]uint64{
+	"ns": uint64(time.Nanosecond),
+	"us": uint64(time.Microsecond),
+	"µs": uint64(time.Microsecond), // U+00B5 = micro symbol
+	"μs": uint64(time.Microsecond), // U+03BC = Greek letter mu
+	"ms": uint64(time.Millisecond),
+	"s":  uint64(time.Second),
+	"m":  uint64(time.Minute),
+	"h":  uint64(time.Hour),
+	"d":  uint64(time.Hour * 24),
+}
+
+func leadingFraction(s string) (x uint64, scale float64, rem string) {
+	i := 0
+	scale = 1
+	overflow := false
+	for ; i < len(s); i++ {
+		c := s[i]
+		if c < '0' || c > '9' {
+			break
+		}
+		if overflow {
+			continue
+		}
+		if x > (1<<63-1)/10 {
+			// It's possible for overflow to give a positive number, so take care.
+			overflow = true
+			continue
+		}
+		y := x*10 + uint64(c) - '0'
+		if y > 1<<63 {
+			overflow = true
+			continue
+		}
+		x = y
+		scale *= 10
+	}
+	return x, scale, s[i:]
+}
+
+var errLeadingInt = errors.New("time: bad [0-9]*")
+
+func leadingInt(s string) (x uint64, rem string, err error) {
+	i := 0
+	for ; i < len(s); i++ {
+		c := s[i]
+		if c < '0' || c > '9' {
+			break
+		}
+		if x > 1<<63/10 {
+			// overflow
+			return 0, "", errLeadingInt
+		}
+		x = x*10 + uint64(c) - '0'
+		if x > 1<<63 {
+			// overflow
+			return 0, "", errLeadingInt
+		}
+	}
+	return x, s[i:], nil
+}
+func ParseDuration(s string) (time.Duration, error) {
+	// [-+]?([0-9]*(\.[0-9]*)?[a-z]+)+
+	orig := s
+	var d uint64
+	neg := false
+
+	// Consume [-+]?
+	if s != "" {
+		c := s[0]
+		if c == '-' || c == '+' {
+			neg = c == '-'
+			s = s[1:]
+		}
+	}
+	// Special case: if all that is left is "0", this is zero.
+	if s == "0" {
+		return 0, nil
+	}
+	if s == "" {
+		return 0, errors.New("time: invalid duration " + orig)
+	}
+	for s != "" {
+		var (
+			v, f  uint64      // integers before, after decimal point
+			scale float64 = 1 // value = v + f/scale
+		)
+
+		var err error
+
+		// The next character must be [0-9.]
+		if !(s[0] == '.' || '0' <= s[0] && s[0] <= '9') {
+			return 0, errors.New("time: invalid duration " + orig)
+		}
+		// Consume [0-9]*
+		pl := len(s)
+		v, s, err = leadingInt(s)
+		if err != nil {
+			return 0, errors.New("time: invalid duration " + orig)
+		}
+		pre := pl != len(s) // whether we consumed anything before a period
+
+		// Consume (\.[0-9]*)?
+		post := false
+		if s != "" && s[0] == '.' {
+			s = s[1:]
+			pl := len(s)
+			f, scale, s = leadingFraction(s)
+			post = pl != len(s)
+		}
+		if !pre && !post {
+			// no digits (e.g. ".s" or "-.s")
+			return 0, errors.New("time: invalid duration " + orig)
+		}
+
+		// Consume unit.
+		i := 0
+		for ; i < len(s); i++ {
+			c := s[i]
+			if c == '.' || '0' <= c && c <= '9' {
+				break
+			}
+		}
+		if i == 0 {
+			return 0, errors.New("time: missing unit in duration " + orig)
+		}
+		u := s[:i]
+		s = s[i:]
+		unit, ok := unitMap[u]
+		if !ok {
+			return 0, errors.New("time: unknown unit " + u + " in duration " + orig)
+		}
+		if v > 1<<63/unit {
+			// overflow
+			return 0, errors.New("time: invalid duration " + orig)
+		}
+		v *= unit
+		if f > 0 {
+			// float64 is needed to be nanosecond accurate for fractions of hours.
+			// v >= 0 && (f*unit/scale) <= 3.6e+12 (ns/h, h is the largest unit)
+			v += uint64(float64(f) * (float64(unit) / scale))
+			if v > 1<<63 {
+				// overflow
+				return 0, errors.New("time: invalid duration " + orig)
+			}
+		}
+		d += v
+		if d > 1<<63 {
+			return 0, errors.New("time: invalid duration " + orig)
+		}
+	}
+	if neg {
+		return -time.Duration(d), nil
+	}
+	if d > 1<<63-1 {
+		return 0, errors.New("time: invalid duration " + orig)
+	}
+	return time.Duration(d), nil
+}
+func RolloverTime(fieldTime time.Time, rolloverDuration time.Duration) (time.Time, error) {
+	rolloverTime := time.Time{}
+
+	if rolloverDuration.Seconds() >= float64(time.Hour*24) {
+		rolloverSeconds := fieldTime.Unix() - fieldTime.Unix()%int64(rolloverDuration.Seconds())
+		rolloverTime = time.Unix(rolloverSeconds, 0)
+	} else {
+		rolloverSeconds := fieldTime.Unix() - fieldTime.Unix()%int64(time.Hour*24)%int64(rolloverDuration.Seconds())
+		rolloverTime = time.Unix(rolloverSeconds, 0)
+	}
+
+	return rolloverTime, nil
+}
+func main1() {
+	var rolloverTime = "3h"
+	fieldTime := time.Unix(int64(1656081050), 0)
+	//00:00:00-00:10:00
+	//每天共多少个间隔分钟的时段
+	//时间模板
+	rolloverDuration, err := ParseDuration(rolloverTime)
+	if err != nil {
+		fmt.Printf("Unable to start bulk processor: %s", err)
+	}
+
+	fmt.Printf("fieldTime : %s \r\n", fieldTime.Format("2006-01-02 15:04:05"))
+	fmt.Printf("rolloverDuration: %d \n", int(rolloverDuration.Seconds()))
+	aaa, eee := RolloverTime(fieldTime, rolloverDuration)
+	if eee != nil {
+		fmt.Printf("rollover error: %s", err)
+	}
+	fmt.Println("rolloverTime:" + aaa.Format("2006-01-02 15:04:05"))
+	//定制初始时间
+
+}
 func (ic *indexClient) mapIndex(op *gtm.Op) *indexMapping {
 	mapping := ic.defaultIndexMapping(op)
 	if m := mapIndexTypes[op.Namespace]; m != nil {
 		if m.Index != "" {
 			mapping.Index = m.Index
+		}
+		if m.Rollover != nil {
+			rolloverValue := op.Data[m.Rollover.Field]
+			switch fieldTime := rolloverValue.(type) {
+			case time.Time:
+				rolloverTime, err := RolloverTime(fieldTime, m.Rollover.Duration)
+				if err != nil {
+					mapping.Index = m.Index + "-" + rolloverTime.Format(m.Rollover.Format)
+					infoLog.Printf("Rollover key:%s, index:%s", rolloverValue, mapping.Index)
+				} else {
+					errorLog.Printf("Rollover err:%s", err)
+				}
+			default:
+			}
+
 		}
 		if m.Pipeline != "" {
 			mapping.Pipeline = m.Pipeline
@@ -1822,6 +2041,19 @@ func (config *configOptions) loadIndexTypes() {
 				mapIndexTypes[m.Namespace] = &indexMapping{
 					Namespace: m.Namespace,
 					Index:     strings.ToLower(m.Index),
+					Rollover:  m.Rollover,
+				}
+				rollover := mapIndexTypes[m.Namespace].Rollover
+				if rollover != nil {
+					if rollover.Time != "" {
+						duration, err := ParseDuration(rollover.Time)
+						if err != nil {
+							errorLog.Fatalln("index: ["+m.Index+"] rollover.time field is wrong:["+rollover.Time+"],eg. 1d,1h,1m. error:", err)
+							mapIndexTypes[m.Namespace].Rollover = nil
+						} else {
+							mapIndexTypes[m.Namespace].Rollover.Duration = duration
+						}
+					}
 				}
 			} else {
 				errorLog.Fatalln("Mappings must specify namespace and index")
@@ -5082,9 +5314,14 @@ func (ic *indexClient) saveTimestampFromReplStatus() {
 }
 
 func mustConfig() *configOptions {
+
 	config := &configOptions{
 		GtmSettings: gtmDefaultSettings(),
 		LogRotate:   logRotateDefaults(),
+	}
+	if file, err := toml.DecodeFile("/Users/yangyang/Chuanyi/GoCode/monstache/monstache_master.properties", config); err != nil {
+		fmt.Printf("error %s", err)
+		fmt.Printf("file %s", file)
 	}
 	config.parseCommandLineFlags()
 	if config.Version {
