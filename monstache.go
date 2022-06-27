@@ -202,22 +202,27 @@ type relation struct {
 	db             string
 	col            string
 }
-
+type rolloverIndex struct {
+	BeforeRollover *rollover
+	AfterRollover  *rollover
+	Field          string
+}
 type rollover struct {
 	// 类型 绝对值 absolute 相对值 relative
 	Type string
 	// 滚动时间 1s 1h 1d 7d 15d
-	Time     string
-	Duration time.Duration
-	Format   string
-	Field    string
+	Time      string
+	Duration  time.Duration
+	Format    string
+	StartTime time.Time
+	EndTime   time.Time
 }
 
 type indexMapping struct {
-	Namespace string
-	Index     string
-	Pipeline  string
-	Rollover  *rollover
+	Namespace     string
+	Index         string
+	Pipeline      string
+	RolloverIndex *rolloverIndex
 }
 
 type findConf struct {
@@ -370,7 +375,7 @@ type configOptions struct {
 	OplogTsFieldName            string `toml:"oplog-ts-field-name"`
 	OplogDateFieldName          string `toml:"oplog-date-field-name"`
 	OplogDateFieldFormat        string `toml:"oplog-date-field-format"`
-	ExitAfterDirectReads        bool   `toml:"exit-after-direct-reads"`
+	ExitAfterDirectReads        bool   `toml:"exit-afterRollover-direct-reads"`
 	MergePatchAttr              string `toml:"merge-patch-attribute"`
 	ElasticMaxConns             int    `toml:"elasticsearch-max-conns"`
 	ElasticRetry                bool   `toml:"elasticsearch-retry"`
@@ -826,7 +831,7 @@ func ParseDuration(s string) (time.Duration, error) {
 	}
 	for s != "" {
 		var (
-			v, f  uint64      // integers before, after decimal point
+			v, f  uint64      // integers beforeRollover, afterRollover decimal point
 			scale float64 = 1 // value = v + f/scale
 		)
 
@@ -842,7 +847,7 @@ func ParseDuration(s string) (time.Duration, error) {
 		if err != nil {
 			return 0, errors.New("time: invalid duration " + orig)
 		}
-		pre := pl != len(s) // whether we consumed anything before a period
+		pre := pl != len(s) // whether we consumed anything beforeRollover a period
 
 		// Consume (\.[0-9]*)?
 		post := false
@@ -901,27 +906,41 @@ func ParseDuration(s string) (time.Duration, error) {
 	}
 	return time.Duration(d), nil
 }
-func RolloverTime(rolloverType string, fieldTime time.Time, rolloverDuration time.Duration) (time.Time, error) {
-	rolloverTime := time.Time{}
+func RolloverIndex(RolloverIndex *rolloverIndex, fieldTime time.Time) (string, error) {
+	if RolloverIndex.AfterRollover != nil && fieldTime.After(RolloverIndex.AfterRollover.EndTime) {
+		return RolloverIndexSuffix(RolloverIndex.AfterRollover.Type, fieldTime, RolloverIndex.AfterRollover.Duration, RolloverIndex.AfterRollover.Format)
+	} else if RolloverIndex.BeforeRollover != nil && RolloverIndex.BeforeRollover.EndTime.After(fieldTime) {
+		return RolloverIndexSuffix(RolloverIndex.BeforeRollover.Type, fieldTime, RolloverIndex.BeforeRollover.Duration, RolloverIndex.BeforeRollover.Format)
+	} else {
+		return "", nil
+	}
+}
+func RolloverIndexSuffix(rolloverType string, fieldTime time.Time, rolloverDuration time.Duration, format string) (string, error) {
+	startTime := time.Time{}
+	endTime := time.Time{}
+
 	if rolloverDuration.Nanoseconds() < int64(1000) {
-		intSec := int(rolloverDuration.Nanoseconds())
-		year := intSec / 12
+		month := int(rolloverDuration.Nanoseconds())
+		year := month / 12
 		if year == 0 {
 			intFieldMonth := int(fieldTime.Month())
-			month := (intFieldMonth) % (intSec)
-			if month == 0 {
-				month = intSec - 1
+			mod := (intFieldMonth) % (month)
+			var addMonth = 0
+			if mod == 0 {
+				addMonth = month - 1
 			} else {
-				month = month - 1
+				addMonth = mod - 1
 			}
-			fieldTime = fieldTime.AddDate(0, -month, 0)
+			startTime = fieldTime.AddDate(0, -addMonth, 0)
+			endTime = startTime.AddDate(0, month-1, 0)
 		} else {
 			intFieldYear := fieldTime.Year()
 			addYear := intFieldYear / year
-			fieldTime = fieldTime.AddDate(-addYear, 0, 0)
+			startTime = fieldTime.AddDate(-addYear, 0, 0)
+			endTime = startTime.AddDate(addYear-1, 0, 0)
 		}
-		rolloverTime = fieldTime
 	} else if rolloverDuration.Seconds() >= float64(60*60*24) {
+		// 天
 		setDay := int(rolloverDuration.Seconds()) / int(60*60*24)
 		addDay := fieldTime.Day() % setDay
 		if addDay == 0 {
@@ -929,14 +948,15 @@ func RolloverTime(rolloverType string, fieldTime time.Time, rolloverDuration tim
 		} else {
 			addDay = addDay - 1
 		}
-		fieldTime = fieldTime.AddDate(0, 0, -addDay)
-		rolloverTime = fieldTime
+		startTime = fieldTime.AddDate(0, 0, -addDay)
+		endTime = startTime.AddDate(0, 0, setDay-1)
 	} else {
 		rolloverSeconds := fieldTime.Unix() - fieldTime.Unix()%int64(time.Hour*24)%int64(rolloverDuration.Seconds())
-		rolloverTime = time.Unix(rolloverSeconds, 0)
+		startTime = time.Unix(rolloverSeconds, 0)
+		endTime = startTime.Add(rolloverDuration)
 	}
 
-	return rolloverTime, nil
+	return startTime.Format(format) + "_" + endTime.Format(format), nil
 }
 func main1() {
 	var rolloverTime = "5d"
@@ -951,11 +971,11 @@ func main1() {
 
 	fmt.Printf("fieldTime : %s \r\n", fieldTime.Format("20060102"))
 	fmt.Printf("rolloverDuration: %d \n", int(rolloverDuration.Seconds()))
-	aaa, eee := RolloverTime("", fieldTime, rolloverDuration)
+	aaa, eee := RolloverIndexSuffix("", fieldTime, rolloverDuration, "20060102")
 	if eee != nil {
 		fmt.Printf("rollover error: %s", err)
 	}
-	fmt.Println("rolloverTime:" + aaa.Format("20060102"))
+	fmt.Println("rolloverTime:" + aaa)
 	//定制初始时间
 
 }
@@ -965,22 +985,22 @@ func (ic *indexClient) mapIndex(op *gtm.Op) *indexMapping {
 		if m.Index != "" {
 			mapping.Index = m.Index
 		}
-		if m.Rollover != nil {
-			rolloverValue := op.Data[m.Rollover.Field]
+		if m.RolloverIndex != nil {
+			rolloverValue := op.Data[m.RolloverIndex.Field]
 			switch fieldTime := rolloverValue.(type) {
 			case time.Time:
-				rolloverTime, err := RolloverTime(m.Rollover.Type, fieldTime, m.Rollover.Duration)
+				rolloverTimeFormat, err := RolloverIndex(m.RolloverIndex, fieldTime)
 				if err == nil {
-					mapping.Index = m.Index + "-" + rolloverTime.Format(m.Rollover.Format)
-					traceLog.Printf("Index Rollover key:%s, index:%s", rolloverValue, mapping.Index)
+					mapping.Index = m.Index + "-" + rolloverTimeFormat
+					traceLog.Printf("Index Rollover key:%s, index:%s", rolloverTimeFormat, mapping.Index)
 				} else {
 					errorLog.Printf("Index Rollover err:%s", err)
 				}
 			case monstachemap.Time:
-				rolloverTime, err := RolloverTime(m.Rollover.Type, fieldTime.Time, m.Rollover.Duration)
+				rolloverTimeFormat, err := RolloverIndex(m.RolloverIndex, fieldTime.Time)
 				if err == nil {
-					mapping.Index = m.Index + "-" + rolloverTime.Format(m.Rollover.Format)
-					traceLog.Printf("Index Rollover key:%s, index:%s", rolloverValue, mapping.Index)
+					mapping.Index = m.Index + "-" + rolloverTimeFormat
+					traceLog.Printf("Index Rollover key:%s, index:%s", rolloverTimeFormat, mapping.Index)
 				} else {
 					errorLog.Printf("Index Rollover err:%s", err)
 				}
@@ -1956,12 +1976,12 @@ func (config *configOptions) parseCommandLineFlags() *configOptions {
 	flag.IntVar(&config.PostProcessors, "post-processors", 0, "Number of post-processing go routines")
 	flag.IntVar(&config.FileDownloaders, "file-downloaders", 0, "GridFs download go routines")
 	flag.IntVar(&config.RelateThreads, "relate-threads", 0, "Number of threads dedicated to processing relationships")
-	flag.IntVar(&config.RelateBuffer, "relate-buffer", 0, "Number of relates to queue before skipping and reporting an error")
+	flag.IntVar(&config.RelateBuffer, "relate-buffer", 0, "Number of relates to queue beforeRollover skipping and reporting an error")
 	flag.BoolVar(&config.ElasticRetry, "elasticsearch-retry", false, "True to retry failed request to Elasticsearch")
-	flag.IntVar(&config.ElasticMaxDocs, "elasticsearch-max-docs", 0, "Number of docs to hold before flushing to Elasticsearch")
-	flag.IntVar(&config.ElasticMaxBytes, "elasticsearch-max-bytes", 0, "Number of bytes to hold before flushing to Elasticsearch")
-	flag.IntVar(&config.ElasticMaxSeconds, "elasticsearch-max-seconds", 0, "Number of seconds before flushing to Elasticsearch")
-	flag.IntVar(&config.ElasticClientTimeout, "elasticsearch-client-timeout", 0, "Number of seconds before a request to Elasticsearch is timed out")
+	flag.IntVar(&config.ElasticMaxDocs, "elasticsearch-max-docs", 0, "Number of docs to hold beforeRollover flushing to Elasticsearch")
+	flag.IntVar(&config.ElasticMaxBytes, "elasticsearch-max-bytes", 0, "Number of bytes to hold beforeRollover flushing to Elasticsearch")
+	flag.IntVar(&config.ElasticMaxSeconds, "elasticsearch-max-seconds", 0, "Number of seconds beforeRollover flushing to Elasticsearch")
+	flag.IntVar(&config.ElasticClientTimeout, "elasticsearch-client-timeout", 0, "Number of seconds beforeRollover a request to Elasticsearch is timed out")
 	flag.Int64Var(&config.MaxFileSize, "max-file-size", 0, "GridFs file content exceeding this limit in bytes will not be indexed in Elasticsearch")
 	flag.StringVar(&config.ConfigFile, "f", "", "Location of configuration file")
 	flag.BoolVar(&config.DroppedDatabases, "dropped-databases", true, "True to delete indexes from dropped databases")
@@ -1976,7 +1996,7 @@ func (config *configOptions) parseCommandLineFlags() *configOptions {
 	flag.BoolVar(&config.EnableEasyJSON, "enable-easy-json", false, "True to enable easy-json serialization")
 	flag.BoolVar(&config.Stats, "stats", false, "True to print out statistics")
 	flag.BoolVar(&config.IndexStats, "index-stats", false, "True to index stats in elasticsearch")
-	flag.StringVar(&config.StatsDuration, "stats-duration", "", "The duration after which stats are logged")
+	flag.StringVar(&config.StatsDuration, "stats-duration", "", "The duration afterRollover which stats are logged")
 	flag.StringVar(&config.StatsIndexFormat, "stats-index-format", "", "time.Time supported format to use for the stats index names")
 	flag.BoolVar(&config.Resume, "resume", false, "True to capture the last timestamp of this run and resume on a subsequent run")
 	flag.Var(&config.ResumeStrategy, "resume-strategy", "Strategy to use for resuming. 0=timestamp,1=token")
@@ -1991,7 +2011,7 @@ func (config *configOptions) parseCommandLineFlags() *configOptions {
 	flag.BoolVar(&config.EnablePatches, "enable-patches", false, "True to include an json-patch field on updates")
 	flag.BoolVar(&config.FailFast, "fail-fast", false, "True to exit if a single _bulk request fails")
 	flag.BoolVar(&config.IndexOplogTime, "index-oplog-time", false, "True to add date/time information from the oplog to each document when indexing")
-	flag.BoolVar(&config.ExitAfterDirectReads, "exit-after-direct-reads", false, "True to exit the program after reading directly from the configured namespaces")
+	flag.BoolVar(&config.ExitAfterDirectReads, "exit-afterRollover-direct-reads", false, "True to exit the program afterRollover reading directly from the configured namespaces")
 	flag.StringVar(&config.MergePatchAttr, "merge-patch-attribute", "", "Attribute to store json-patch values under")
 	flag.StringVar(&config.ResumeName, "resume-name", "", "Name under which to load/store the resume state. Defaults to 'default'")
 	flag.StringVar(&config.ClusterName, "cluster-name", "", "Name of the monstache process cluster")
@@ -2074,19 +2094,35 @@ func (config *configOptions) loadIndexTypes() {
 		for _, m := range config.Mapping {
 			if m.Namespace != "" && m.Index != "" {
 				mapIndexTypes[m.Namespace] = &indexMapping{
-					Namespace: m.Namespace,
-					Index:     strings.ToLower(m.Index),
-					Rollover:  m.Rollover,
+					Namespace:     m.Namespace,
+					Index:         strings.ToLower(m.Index),
+					RolloverIndex: m.RolloverIndex,
 				}
-				rollover := mapIndexTypes[m.Namespace].Rollover
+				rollover := mapIndexTypes[m.Namespace].RolloverIndex
 				if rollover != nil {
-					if rollover.Time != "" {
-						duration, err := ParseDuration(rollover.Time)
-						if err != nil {
-							errorLog.Fatalln("index: ["+m.Index+"] rollover.time :["+rollover.Time+"] is wrong.eg. 1Y,1M,1d,1h,1m. error:", err)
-						} else {
-							mapIndexTypes[m.Namespace].Rollover.Duration = duration
+					if rollover.AfterRollover != nil {
+						if rollover.AfterRollover.Time != "" {
+							duration, err := ParseDuration(rollover.AfterRollover.Time)
+							if err != nil {
+								errorLog.Fatalln("index: ["+m.Index+"] rollover. after time :["+rollover.AfterRollover.Time+"] is wrong.eg. 1Y,1M,1d,1h,1m. error:", err)
+							} else {
+								mapIndexTypes[m.Namespace].RolloverIndex.AfterRollover.Duration = duration
+							}
 						}
+					} else {
+						mapIndexTypes[m.Namespace].RolloverIndex.AfterRollover = nil
+					}
+					if rollover.BeforeRollover != nil {
+						if rollover.BeforeRollover.Time != "" {
+							duration, err := ParseDuration(rollover.BeforeRollover.Time)
+							if err != nil {
+								errorLog.Fatalln("index: ["+m.Index+"] rollover.before time :["+rollover.BeforeRollover.Time+"] is wrong.eg. 1Y,1M,1d,1h,1m. error:", err)
+							} else {
+								mapIndexTypes[m.Namespace].RolloverIndex.BeforeRollover.Duration = duration
+							}
+						}
+					} else {
+						mapIndexTypes[m.Namespace].RolloverIndex.BeforeRollover = nil
 					}
 				}
 			} else {
@@ -5353,10 +5389,10 @@ func mustConfig() *configOptions {
 		GtmSettings: gtmDefaultSettings(),
 		LogRotate:   logRotateDefaults(),
 	}
-	//if file, err := toml.DecodeFile("/Users/yangyang/Chuanyi/GoCode/monstache/monstache_master.properties", config); err != nil {
-	//	fmt.Printf("error %s", err)
-	//	fmt.Printf("file %s", file)
-	//}
+	if file, err := toml.DecodeFile("/Users/yangyang/Chuanyi/GoCode/monstache/monstache_master.properties", config); err != nil {
+		fmt.Printf("error %s", err)
+		fmt.Printf("file %s", file)
+	}
 	config.parseCommandLineFlags()
 	if config.Version {
 		fmt.Println(version)
@@ -5376,7 +5412,7 @@ func validateFeatures(config *configOptions, mongoInfo *buildInfo) {
 	if len(mongoInfo.VersionArray) < 2 {
 		return
 	}
-	const featErr1 = "Change streams are not supported by the server before version 3.6 (see enable-oplog)"
+	const featErr1 = "Change streams are not supported by the server beforeRollover version 3.6 (see enable-oplog)"
 	const featErr2 = "Resuming streams using timestamps requires server version 4.0 or greater (see resume-strategy)"
 	const featErr3 = "A token based resume strategy is only supported for server version 3.6 or greater"
 	major, minor := mongoInfo.VersionArray[0], mongoInfo.VersionArray[1]
@@ -5439,7 +5475,6 @@ func buildElasticClient(config *configOptions) *elastic.Client {
 }
 
 func main() {
-
 	config := mustConfig()
 
 	sh := &sigHandler{
