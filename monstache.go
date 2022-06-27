@@ -907,7 +907,7 @@ func ParseDuration(s string) (time.Duration, error) {
 	return time.Duration(d), nil
 }
 func RolloverIndex(RolloverIndex *rolloverIndex, fieldTime time.Time) (string, error) {
-	if RolloverIndex.AfterRollover != nil && fieldTime.After(RolloverIndex.AfterRollover.EndTime) {
+	if RolloverIndex.AfterRollover != nil && fieldTime.After(RolloverIndex.AfterRollover.StartTime) {
 		return RolloverIndexSuffix(RolloverIndex.AfterRollover.Type, fieldTime, RolloverIndex.AfterRollover.Duration, RolloverIndex.AfterRollover.Format)
 	} else if RolloverIndex.BeforeRollover != nil && RolloverIndex.BeforeRollover.EndTime.After(fieldTime) {
 		return RolloverIndexSuffix(RolloverIndex.BeforeRollover.Type, fieldTime, RolloverIndex.BeforeRollover.Duration, RolloverIndex.BeforeRollover.Format)
@@ -935,9 +935,15 @@ func RolloverIndexSuffix(rolloverType string, fieldTime time.Time, rolloverDurat
 			endTime = startTime.AddDate(0, month-1, 0)
 		} else {
 			intFieldYear := fieldTime.Year()
-			addYear := intFieldYear / year
+			modYear := intFieldYear % year
+			var addYear = 0
+			if modYear == 0 {
+				addYear = year - 1
+			} else {
+				addYear = modYear - 1
+			}
 			startTime = fieldTime.AddDate(-addYear, 0, 0)
-			endTime = startTime.AddDate(addYear-1, 0, 0)
+			endTime = startTime.AddDate(year-1, 0, 0)
 		}
 	} else if rolloverDuration.Seconds() >= float64(60*60*24) {
 		// 天
@@ -956,7 +962,7 @@ func RolloverIndexSuffix(rolloverType string, fieldTime time.Time, rolloverDurat
 		endTime = startTime.Add(rolloverDuration)
 	}
 
-	return startTime.Format(format) + "_" + endTime.Format(format), nil
+	return startTime.Format(format) + "to" + endTime.Format(format), nil
 }
 func main1() {
 	var rolloverTime = "5d"
