@@ -1005,7 +1005,7 @@ func (ic *indexClient) mapIndex(op *gtm.Op) *indexMapping {
 				rolloverTimeFormat, err := RolloverIndex(m.RolloverIndex, fieldTime.Time)
 				if err == nil {
 					mapping.Index = m.Index + "-" + rolloverTimeFormat
-					traceLog.Printf("Index Rollover key:%s, index:%s", rolloverTimeFormat, mapping.Index)
+					//traceLog.Printf("Index Rollover key:%s, index:%s", rolloverTimeFormat, mapping.Index)
 				} else {
 					errorLog.Printf("Index Rollover err:%s", err)
 				}
