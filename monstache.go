@@ -203,7 +203,7 @@ type relation struct {
 	col            string
 }
 
-type indexTimeRollover struct {
+type rollover struct {
 	// 类型 绝对值 absolute 相对值 relative
 	Type string
 	// 滚动时间 1s 1h 1d 7d 15d
@@ -217,7 +217,7 @@ type indexMapping struct {
 	Namespace string
 	Index     string
 	Pipeline  string
-	Rollover  *indexTimeRollover
+	Rollover  *rollover
 }
 
 type findConf struct {
@@ -750,6 +750,8 @@ var unitMap = map[string]uint64{
 	"m":  uint64(time.Minute),
 	"h":  uint64(time.Hour),
 	"d":  uint64(time.Hour * 24),
+	"M":  uint64(time.Nanosecond),
+	"Y":  uint64(time.Nanosecond * 12),
 }
 
 func leadingFraction(s string) (x uint64, scale float64, rem string) {
@@ -899,12 +901,36 @@ func ParseDuration(s string) (time.Duration, error) {
 	}
 	return time.Duration(d), nil
 }
-func RolloverTime(fieldTime time.Time, rolloverDuration time.Duration) (time.Time, error) {
+func RolloverTime(rolloverType string, fieldTime time.Time, rolloverDuration time.Duration) (time.Time, error) {
 	rolloverTime := time.Time{}
-
-	if rolloverDuration.Seconds() >= float64(time.Hour*24) {
-		rolloverSeconds := fieldTime.Unix() - fieldTime.Unix()%int64(rolloverDuration.Seconds())
-		rolloverTime = time.Unix(rolloverSeconds, 0)
+	if rolloverDuration.Nanoseconds() < int64(1000) {
+		intSec := int(rolloverDuration.Nanoseconds())
+		year := intSec / 12
+		if year == 0 {
+			intFieldMonth := int(fieldTime.Month())
+			month := (intFieldMonth) % (intSec)
+			if month == 0 {
+				month = intSec - 1
+			} else {
+				month = month - 1
+			}
+			fieldTime = fieldTime.AddDate(0, -month, 0)
+		} else {
+			intFieldYear := fieldTime.Year()
+			addYear := intFieldYear / year
+			fieldTime = fieldTime.AddDate(-addYear, 0, 0)
+		}
+		rolloverTime = fieldTime
+	} else if rolloverDuration.Seconds() >= float64(60*60*24) {
+		setDay := int(rolloverDuration.Seconds()) / int(60*60*24)
+		addDay := fieldTime.Day() % setDay
+		if addDay == 0 {
+			addDay = setDay - 1
+		} else {
+			addDay = addDay - 1
+		}
+		fieldTime = fieldTime.AddDate(0, 0, -addDay)
+		rolloverTime = fieldTime
 	} else {
 		rolloverSeconds := fieldTime.Unix() - fieldTime.Unix()%int64(time.Hour*24)%int64(rolloverDuration.Seconds())
 		rolloverTime = time.Unix(rolloverSeconds, 0)
@@ -913,8 +939,8 @@ func RolloverTime(fieldTime time.Time, rolloverDuration time.Duration) (time.Tim
 	return rolloverTime, nil
 }
 func main1() {
-	var rolloverTime = "3h"
-	fieldTime := time.Unix(int64(1656081050), 0)
+	var rolloverTime = "5d"
+	fieldTime := time.Unix(int64(1672119663), 0)
 	//00:00:00-00:10:00
 	//每天共多少个间隔分钟的时段
 	//时间模板
@@ -923,13 +949,13 @@ func main1() {
 		fmt.Printf("Unable to start bulk processor: %s", err)
 	}
 
-	fmt.Printf("fieldTime : %s \r\n", fieldTime.Format("2006-01-02 15:04:05"))
+	fmt.Printf("fieldTime : %s \r\n", fieldTime.Format("20060102"))
 	fmt.Printf("rolloverDuration: %d \n", int(rolloverDuration.Seconds()))
-	aaa, eee := RolloverTime(fieldTime, rolloverDuration)
+	aaa, eee := RolloverTime("", fieldTime, rolloverDuration)
 	if eee != nil {
 		fmt.Printf("rollover error: %s", err)
 	}
-	fmt.Println("rolloverTime:" + aaa.Format("2006-01-02 15:04:05"))
+	fmt.Println("rolloverTime:" + aaa.Format("20060102"))
 	//定制初始时间
 
 }
@@ -943,14 +969,15 @@ func (ic *indexClient) mapIndex(op *gtm.Op) *indexMapping {
 			rolloverValue := op.Data[m.Rollover.Field]
 			switch fieldTime := rolloverValue.(type) {
 			case time.Time:
-				rolloverTime, err := RolloverTime(fieldTime, m.Rollover.Duration)
+				rolloverTime, err := RolloverTime(m.Rollover.Type, fieldTime, m.Rollover.Duration)
 				if err != nil {
 					mapping.Index = m.Index + "-" + rolloverTime.Format(m.Rollover.Format)
-					infoLog.Printf("Rollover key:%s, index:%s", rolloverValue, mapping.Index)
+					traceLog.Printf("Index Rollover key:%s, index:%s", rolloverValue, mapping.Index)
 				} else {
-					errorLog.Printf("Rollover err:%s", err)
+					errorLog.Printf("Index Rollover err:%s", err)
 				}
 			default:
+				errorLog.Printf("Index Rollover error time:%s", fieldTime)
 			}
 
 		}
@@ -2048,8 +2075,7 @@ func (config *configOptions) loadIndexTypes() {
 					if rollover.Time != "" {
 						duration, err := ParseDuration(rollover.Time)
 						if err != nil {
-							errorLog.Fatalln("index: ["+m.Index+"] rollover.time field is wrong:["+rollover.Time+"],eg. 1d,1h,1m. error:", err)
-							mapIndexTypes[m.Namespace].Rollover = nil
+							errorLog.Fatalln("index: ["+m.Index+"] rollover.time :["+rollover.Time+"] is wrong.eg. 1Y,1M,1d,1h,1m. error:", err)
 						} else {
 							mapIndexTypes[m.Namespace].Rollover.Duration = duration
 						}
