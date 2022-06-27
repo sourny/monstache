@@ -5345,10 +5345,7 @@ func mustConfig() *configOptions {
 		GtmSettings: gtmDefaultSettings(),
 		LogRotate:   logRotateDefaults(),
 	}
-	if file, err := toml.DecodeFile("/Users/yangyang/Chuanyi/GoCode/monstache/monstache_master.properties", config); err != nil {
-		fmt.Printf("error %s", err)
-		fmt.Printf("file %s", file)
-	}
+
 	config.parseCommandLineFlags()
 	if config.Version {
 		fmt.Println(version)
