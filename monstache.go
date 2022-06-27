@@ -970,7 +970,15 @@ func (ic *indexClient) mapIndex(op *gtm.Op) *indexMapping {
 			switch fieldTime := rolloverValue.(type) {
 			case time.Time:
 				rolloverTime, err := RolloverTime(m.Rollover.Type, fieldTime, m.Rollover.Duration)
-				if err != nil {
+				if err == nil {
+					mapping.Index = m.Index + "-" + rolloverTime.Format(m.Rollover.Format)
+					traceLog.Printf("Index Rollover key:%s, index:%s", rolloverValue, mapping.Index)
+				} else {
+					errorLog.Printf("Index Rollover err:%s", err)
+				}
+			case monstachemap.Time:
+				rolloverTime, err := RolloverTime(m.Rollover.Type, fieldTime.Time, m.Rollover.Duration)
+				if err == nil {
 					mapping.Index = m.Index + "-" + rolloverTime.Format(m.Rollover.Format)
 					traceLog.Printf("Index Rollover key:%s, index:%s", rolloverValue, mapping.Index)
 				} else {
@@ -5345,7 +5353,10 @@ func mustConfig() *configOptions {
 		GtmSettings: gtmDefaultSettings(),
 		LogRotate:   logRotateDefaults(),
 	}
-
+	//if file, err := toml.DecodeFile("/Users/yangyang/Chuanyi/GoCode/monstache/monstache_master.properties", config); err != nil {
+	//	fmt.Printf("error %s", err)
+	//	fmt.Printf("file %s", file)
+	//}
 	config.parseCommandLineFlags()
 	if config.Version {
 		fmt.Println(version)
