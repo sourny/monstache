@@ -1010,7 +1010,7 @@ func (ic *indexClient) mapIndex(op *gtm.Op) *indexMapping {
 					errorLog.Printf("Index Rollover err:%s", err)
 				}
 			default:
-				errorLog.Printf("Index Rollover error time:%s", fieldTime)
+				errorLog.Printf("Index Rollover error time:%s,date: %s", fieldTime, op.Data)
 			}
 
 		}
