@@ -221,6 +221,7 @@ type rollover struct {
 type indexMapping struct {
 	Namespace     string
 	Index         string
+	RoutingKey    string
 	Pipeline      string
 	RolloverIndex *rolloverIndex
 }
@@ -990,6 +991,10 @@ func (ic *indexClient) mapIndex(op *gtm.Op) *indexMapping {
 	if m := mapIndexTypes[op.Namespace]; m != nil {
 		if m.Index != "" {
 			mapping.Index = m.Index
+		}
+		if m.RoutingKey != "" {
+			mapping.RoutingKey = m.RoutingKey
+			op.Data["mo_routing_key"] = m.RoutingKey
 		}
 		if m.RolloverIndex != nil {
 			rolloverValue := op.Data[m.RolloverIndex.Field]
@@ -2102,6 +2107,7 @@ func (config *configOptions) loadIndexTypes() {
 					Namespace:     m.Namespace,
 					Index:         strings.ToLower(m.Index),
 					RolloverIndex: m.RolloverIndex,
+					RoutingKey:    m.RoutingKey,
 				}
 				rollover := mapIndexTypes[m.Namespace].RolloverIndex
 				if rollover != nil {
@@ -3383,6 +3389,7 @@ func (ic *indexClient) doIndexing(op *gtm.Op) (err error) {
 	} else if len(objectID) > 512 {
 		return fmt.Errorf("Unable to index document with _id %s: _id length exceeds max of 512 bytes", objectID)
 	}
+
 	if ic.config.EnablePatches {
 		if patchNamespaces[op.Namespace] {
 			if e := ic.addPatch(op, objectID, indexType, meta); e != nil {
@@ -3403,6 +3410,9 @@ func (ic *indexClient) doIndexing(op *gtm.Op) (err error) {
 		req.DocAsUpsert(true)
 		if meta.ID != "" {
 			req.Id(meta.ID)
+		}
+		if indexType.RoutingKey != "" {
+			req.Routing(indexType.RoutingKey)
 		}
 		if meta.Index != "" {
 			req.Index(meta.Index)
@@ -3426,6 +3436,9 @@ func (ic *indexClient) doIndexing(op *gtm.Op) (err error) {
 		req.Index(indexType.Index)
 		req.Pipeline(indexType.Pipeline)
 		req.Doc(op.Data)
+		if indexType.RoutingKey != "" {
+			req.Routing(indexType.RoutingKey)
+		}
 		if meta.ID != "" {
 			req.Id(meta.ID)
 		}
@@ -4265,6 +4278,9 @@ func (ic *indexClient) doDelete(op *gtm.Op) {
 		req.Index(indexType.Index)
 		if meta.Index != "" {
 			req.Index(meta.Index)
+		}
+		if indexType.RoutingKey != "" {
+			req.Routing(indexType.RoutingKey)
 		}
 		if meta.Routing != "" {
 			req.Routing(meta.Routing)
