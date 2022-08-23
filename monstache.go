@@ -3412,7 +3412,7 @@ func (ic *indexClient) doIndexing(op *gtm.Op) (err error) {
 			req.Id(meta.ID)
 		}
 		if indexType.RoutingKey != "" {
-			req.Routing(indexType.RoutingKey)
+			req.Routing(fmt.Sprintf("%v", op.Data[indexType.RoutingKey]))
 		}
 		if meta.Index != "" {
 			req.Index(meta.Index)
@@ -3437,7 +3437,7 @@ func (ic *indexClient) doIndexing(op *gtm.Op) (err error) {
 		req.Pipeline(indexType.Pipeline)
 		req.Doc(op.Data)
 		if indexType.RoutingKey != "" {
-			req.Routing(indexType.RoutingKey)
+			req.Routing(fmt.Sprintf("%v", op.Data[indexType.RoutingKey]))
 		}
 		if meta.ID != "" {
 			req.Id(meta.ID)
@@ -4280,7 +4280,7 @@ func (ic *indexClient) doDelete(op *gtm.Op) {
 			req.Index(meta.Index)
 		}
 		if indexType.RoutingKey != "" {
-			req.Routing(indexType.RoutingKey)
+			req.Routing(fmt.Sprintf("%v", op.Data[indexType.RoutingKey]))
 		}
 		if meta.Routing != "" {
 			req.Routing(meta.Routing)
